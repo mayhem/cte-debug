@@ -2,6 +2,12 @@
 
 import re
 
+import psycopg2
+import psycopg2.extras
+from tabulate import tabulate
+
+import config
+
 query = """WITH mbids(mbid, score) AS (
                                VALUES %s
                            ), similar_artists AS (
@@ -118,14 +124,36 @@ def execute_partial_cte(sql_query, arguments, query_count):
 #        print("%d ->%s<- (%s)" % (query["arg_count"], query["query"], ",".join([ str(a) for a in query["arguments"]])))
 #        print()
 
-    last = sub_queries[query_count]
+    last = sub_queries[query_count - 1]
     sub_queries.pop(query_count)
+    
+    last["query"] = re.sub(r',[^(]+?\(', '', last["query"], count=1).strip()
+    if last["query"][-1] == ')':
+        last["query"] = last["query"][:-1]
+    
+    final_query = ""
+    final_args = []
+    for q in sub_queries[:query_count-1]:
+        final_query += q["query"]
+        final_args.extend(q["arguments"])
 
-    last["query"] = re.sub(r',[^(]+\(', '', last["query"])
+    final_query += " " + last["query"]
+    final_args.extend(last["arguments"])
 
-    final_query = " ".join([ q["query"] for q in sub_queries[:query_count-1]]) + " " + last["query"]
-    print(final_query)
+    first_row = None
+    with psycopg2.connect(config.CONNECT_URI) as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as curs:
+            curs.execute(final_query, tuple(final_args))
+            data = []
+            for row in curs:
+                if first_row is None:
+                    first_row = dict(row)
+                data.append(list(row))
+
+    first_data = [ k for k in first_row.keys() ]
+    data.insert(0, first_data)
+    print(tabulate(data))
 
 
 if __name__ == "__main__":
-    execute_partial_cte(query, ["8f6bd1e4-fbe1-4f50-aa9b-94c450ec0f11", 15, .7, .8, 8, .7, .8, 30], 4)
+    execute_partial_cte(query, [("8f6bd1e4-fbe1-4f50-aa9b-94c450ec0f11", 0), 15, .7, .8, 8, .7, .8, 30], 3)
