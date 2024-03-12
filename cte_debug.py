@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-
+from random import randint
+import sys
 import re
 
 import psycopg2
@@ -13,7 +14,7 @@ query = """WITH mbids(mbid, score) AS (
                            ), similar_artists AS (
                                SELECT CASE WHEN mbid0 = mbid::UUID THEN mbid1::TEXT ELSE mbid0::TEXT END AS similar_artist_mbid
                                     , sa.score
-                                    , PERCENT_RANK() OVER (PARTITION BY mbid ORDER BY sa.score) AS rank
+                                    , ROW_NUMBER() OVER (PARTITION BY mbid ORDER BY sa.score DESC) AS rownum
                                  FROM similarity.artist sa
                                  JOIN mbids
                                    ON TRUE
@@ -21,19 +22,19 @@ query = """WITH mbids(mbid, score) AS (
                            ), knockdown AS (
                                SELECT similar_artist_mbid
                                     , CASE WHEN similar_artist_mbid = oa.artist_mbid::TEXT THEN score * oa.factor ELSE score END AS score   
-                                    , rank
+                                    , rownum
                                  FROM similar_artists sa
                             LEFT JOIN similarity.overhyped_artists oa
                                    ON sa.similar_artist_mbid = oa.artist_mbid::TEXT
-                             ORDER BY score DESC
+                             ORDER BY rownum
                                 LIMIT %s
                            ), select_similar_artists AS (
                                SELECT similar_artist_mbid
                                     , score
+                                    --, rownum
                                  FROM knockdown
-                                WHERE rank >= %s and rank < %s
-                                ORDER BY score
-                                LIMIT %s
+                                WHERE rownum in %s
+                                ORDER BY rownum
                            ), similar_artists_and_orig_artist AS (
                                SELECT *
                                  FROM select_similar_artists
@@ -70,7 +71,7 @@ query = """WITH mbids(mbid, score) AS (
                                SELECT sa.similar_artist_mbid
                                     , gs.recording_mbid
                                     , total_listen_count
-                                    , PERCENT_RANK() OVER (PARTITION BY similar_artist_mbid ORDER BY sa.similar_artist_mbid, total_listen_count ) AS rank
+                                    , PERCENT_RANK() OVER (PARTITION BY sa.similar_artist_mbid ORDER BY sa.similar_artist_mbid, total_listen_count ) AS rank
                                  FROM group_similarity gs
                                  JOIN similar_artists_and_orig_artist sa
                                    ON sa.similar_artist_mbid::UUID = gs.artist_mbid
@@ -92,53 +93,53 @@ query = """WITH mbids(mbid, score) AS (
 
 def execute_partial_cte(sql_query, arguments, query_count):
 
-    parens = 0
-    sub_query = ""
-    sub_queries = []
-    for ch in sql_query:
-        if ch == "(":
-            parens += 1
+    if query_count == 0:
+        final_query = sql_query
+        final_args = arguments
+    else:
+        parens = 0
+        sub_query = ""
+        sub_queries = []
+        for ch in sql_query:
+            if ch == "(":
+                parens += 1
 
-        if ch == ")":
-            parens -= 1
-            if parens == 0:
-                sub_query += ch
-                sub_queries.append({"query": sub_query})
-                sub_query = ""
-                continue
+            if ch == ")":
+                parens -= 1
+                if parens == 0:
+                    sub_query += ch
+                    sub_queries.append({"query": sub_query})
+                    sub_query = ""
+                    continue
 
-        sub_query += ch
+            sub_query += ch
 
-    sub_queries.append({"query": sub_query})
+        sub_queries.append({"query": sub_query})
 
-    sub_queries[0]["query"] += sub_queries[1]["query"]
-    del sub_queries[1]
+        sub_queries[0]["query"] += sub_queries[1]["query"]
+        del sub_queries[1]
 
-    for sub_query in sub_queries:
-        sub_query["arg_count"] = sub_query["query"].count("%s")
-        sub_query["arguments"] = arguments[:sub_query["arg_count"]]
-        for i in range(sub_query["arg_count"]):
-            arguments.pop(0)
+        for sub_query in sub_queries:
+            sub_query["arg_count"] = sub_query["query"].count("%s")
+            sub_query["arguments"] = arguments[:sub_query["arg_count"]]
+            for i in range(sub_query["arg_count"]):
+                arguments.pop(0)
 
-#    for query in sub_queries[:query_count-1]:
-#        print("%d ->%s<- (%s)" % (query["arg_count"], query["query"], ",".join([ str(a) for a in query["arguments"]])))
-#        print()
+        last = sub_queries[query_count - 1]
+        sub_queries.pop(query_count)
+        
+        last["query"] = re.sub(r',[^(]+?\(', '', last["query"], count=1).strip()
+        if last["query"][-1] == ')':
+            last["query"] = last["query"][:-1]
+        
+        final_query = ""
+        final_args = []
+        for q in sub_queries[:query_count-1]:
+            final_query += q["query"]
+            final_args.extend(q["arguments"])
 
-    last = sub_queries[query_count - 1]
-    sub_queries.pop(query_count)
-    
-    last["query"] = re.sub(r',[^(]+?\(', '', last["query"], count=1).strip()
-    if last["query"][-1] == ')':
-        last["query"] = last["query"][:-1]
-    
-    final_query = ""
-    final_args = []
-    for q in sub_queries[:query_count-1]:
-        final_query += q["query"]
-        final_args.extend(q["arguments"])
-
-    final_query += " " + last["query"]
-    final_args.extend(last["arguments"])
+        final_query += " " + last["query"]
+        final_args.extend(last["arguments"])
 
     first_row = None
     with psycopg2.connect(config.CONNECT_URI) as conn:
@@ -156,4 +157,18 @@ def execute_partial_cte(sql_query, arguments, query_count):
 
 
 if __name__ == "__main__":
-    execute_partial_cte(query, [("8f6bd1e4-fbe1-4f50-aa9b-94c450ec0f11", 0), 15, .7, .8, 8, .7, .8, 30], 3)
+    num_queries = int(sys.argv[1])
+    max_num_similar_artists = int(sys.argv[2])
+    mode = sys.argv[3]
+
+    step_index = { "easy": (2, 0), "medium": (4, 3), "hard": (10, 10) }
+    steps, offset = step_index[mode]
+
+    artist_indexes = []
+    for i in range(max_num_similar_artists):
+        try:
+            artist_indexes.append(randint((i * steps + offset), ((i + 1) * steps + offset)))
+        except IndexError:
+            break
+
+    execute_partial_cte(query, [("8f6bd1e4-fbe1-4f50-aa9b-94c450ec0f11", 0), 100, tuple(artist_indexes), .7, .8, 30], num_queries)
