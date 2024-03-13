@@ -1,0 +1,8 @@
+# Postgres connect string
+CONNECT_URI = ""
+
+# Put the query to debug here
+QUERY = ""
+
+# Add the list of parameters to the query here:
+QUERY_PARAMS = []
