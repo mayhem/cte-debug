@@ -80,11 +80,28 @@ def execute_partial_cte(sql_query, arguments, query_count):
                     first_row = dict(row)
                 data.append(list(row))
 
-    first_data = [k for k in first_row.keys()]
-    data.insert(0, first_data)
-    print(tabulate(data))
+    return data, list(first_row.keys())
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 1:
+        print("Usage %s: <num subqueries: 0 or 2+> [explain: 0 or 1]" % sys.argv[0])
+        sys.exit(-1)
+
     num_queries = int(sys.argv[1])
-    execute_partial_cte(config.QUERY, config.QUERY_PARAMS, num_queries)
+    if len(sys.argv) == 3 and int(sys.argv[2]):
+        explain = True
+        query = "EXPLAIN " + config.QUERY
+    else:
+        explain = False
+        query = config.QUERY
+
+    rows, headers = execute_partial_cte(query, config.QUERY_PARAMS, num_queries)
+    if explain:
+        from icecream import ic
+        for row in rows:
+            print(row[0])
+    else:
+        tab = [headers]
+        tab.extend(rows)
+        print(tabulate(tab))
